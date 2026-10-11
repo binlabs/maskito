@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>DateKit Segment Navigation — Single-Input PoC</title>
+        <style>
+            :root {
+                color-scheme: light dark;
+                font-family:
+                    system-ui,
+                    -apple-system,
+                    sans-serif;
+            }
+
+            body {
+                max-width: 42rem;
+                margin: 0 auto;
+                padding: 2rem 1rem;
+                line-height: 1.5;
+            }
+
+            h1 {
+                font-size: 1.25rem;
+            }
+
+            .field {
+                margin: 1.5rem 0;
+            }
+
+            label {
+                display: block;
+                font-weight: 600;
+                margin-bottom: 0.5rem;
+            }
+
+            input {
+                font:
+                    1.5rem ui-monospace,
+                    monospace;
+                letter-spacing: 0.1em;
+                padding: 0.5rem 0.75rem;
+                border: 2px solid currentColor;
+                border-radius: 0.5rem;
+                background: Field;
+                color: FieldText;
+            }
+
+            /* The active-segment indicator IS the native text selection. */
+            input::selection {
+                background: Highlight;
+                color: HighlightText;
+            }
+
+            .hint {
+                font-size: 0.9rem;
+                opacity: 0.8;
+            }
+
+            kbd {
+                font:
+                    0.85em ui-monospace,
+                    monospace;
+                border: 1px solid currentColor;
+                border-radius: 0.25rem;
+                padding: 0 0.3em;
+            }
+
+            .visually-hidden {
+                position: absolute;
+                width: 1px;
+                height: 1px;
+                margin: -1px;
+                padding: 0;
+                overflow: hidden;
+                clip: rect(0 0 0 0);
+                white-space: nowrap;
+                border: 0;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>DateKit Segment Navigation — Single-Input PoC</h1>
+
+        <p class="hint">
+            Gate A experiment: can a single <code>&lt;input&gt;</code> deliver
+            acceptable per-segment screen-reader semantics? Turn on VoiceOver
+            (<kbd>Cmd</kbd>+<kbd>F5</kbd>), focus the field, and try the keys
+            below. Record what VoiceOver announces on segment move and on step.
+        </p>
+
+        <div class="field">
+            <label for="date" id="date-label"
+                >Date <span class="hint">(day / month / year)</span></label
+            >
+            <input
+                id="date"
+                type="text"
+                inputmode="numeric"
+                autocomplete="off"
+                placeholder="dd/mm/yyyy"
+                aria-describedby="date-label date-help"
+            />
+        </div>
+
+        <ul class="hint" id="date-help">
+            <li><kbd>Tab</kbd> / <kbd>Shift</kbd>+<kbd>Tab</kbd> — move between segments</li>
+            <li><kbd>←</kbd> / <kbd>→</kbd> — move between segments</li>
+            <li><kbd>↑</kbd> / <kbd>↓</kbd> — step the active segment</li>
+            <li>Type digits to fill the active segment</li>
+        </ul>
+
+        <!-- The a11y layer under test: a polite live region announcing the
+             active segment and its value, since a single input cannot expose
+             native per-segment spinbutton semantics. -->
+        <div id="announcer" role="status" aria-live="polite" class="visually-hidden"></div>
+
+        <script type="module">
+            import {Maskito, maskitoUpdateElement} from 'https://esm.sh/@maskito/core@5.6.0';
+            import {
+                maskitoDate,
+                maskitoWithPlaceholder,
+            } from 'https://esm.sh/@maskito/kit@5.6.0';
+
+            import {
+                getActiveSegment,
+                getAdjacentSegment,
+                getSegments,
+            } from './segment-model.js';
+
+            const MODE = 'dd/mm/yyyy';
+            const SEPARATOR = '/';
+            const LABELS = {day: 'Day', month: 'Month', year: 'Year'};
+            // PoC-simple ranges; real plugin derives day-max from month/year.
+            const RANGES = {day: [1, 31], month: [1, 12], year: [1, 9999]};
+
+            const input = document.getElementById('date');
+            const announcer = document.getElementById('announcer');
+
+            // Show the full "dd/mm/yyyy" placeholder while focused so every
+            // segment occupies a stable position and is always selectable —
+            // this is what makes single-input segment nav possible, and mirrors
+            // how React Aria keeps all segments visible.
+            const dateOptions = maskitoDate({mode: MODE, separator: SEPARATOR});
+            const {plugins, ...placeholderOptions} = maskitoWithPlaceholder(
+                MODE,
+                true,
+            );
+
+            new Maskito(input, {
+                ...dateOptions,
+                // Finding: drop maskitoWithPlaceholder's caret-guard (plugins[0]);
+                // it pins the caret to the typed length and blocks navigation
+                // into empty segments. Keep only its focus/blur fill/clear.
+                plugins: plugins.slice(1).concat(dateOptions.plugins),
+                preprocessors: [
+                    ...placeholderOptions.preprocessors,
+                    ...dateOptions.preprocessors,
+                ],
+                postprocessors: [
+                    ...dateOptions.postprocessors,
+                    ...placeholderOptions.postprocessors,
+                ],
+            });
+
+            function segmentText(segment) {
+                return input.value.slice(segment.from, segment.to).replace(/\D/g, '');
+            }
+
+            function announce(segment) {
+                const digits = segmentText(segment);
+
+                announcer.textContent = `${LABELS[segment.name]}, ${
+                    digits === '' ? 'empty' : digits
+                }`;
+            }
+
+            function selectSegment(segment) {
+                input.setSelectionRange(segment.from, segment.to);
+                announce(segment);
+            }
+
+            function wrap(value, min, max) {
+                const range = max - min + 1;
+
+                return ((((value - min) % range) + range) % range) + min;
+            }
+
+            let programmaticValueChange = false;
+
+            function step(segment, delta) {
+                const [min, max] = RANGES[segment.name];
+                const digits = segmentText(segment);
+                const next =
+                    digits === ''
+                        ? delta > 0
+                            ? min
+                            : max
+                        : wrap(Number(digits) + delta, min, max);
+                const text = String(next).padStart(segment.to - segment.from, '0');
+                const value = input.value;
+                const nextValue =
+                    value.slice(0, segment.from) + text + value.slice(segment.to);
+
+                // Go through maskitoUpdateElement so an `input` event fires:
+                // maskito re-runs its date validation, framework bindings and
+                // mask history stay in sync, and the placeholder plugin doesn't
+                // desync. (Same mechanism the Time stepper uses.) The guard keeps
+                // our own input listener from announcing this change twice.
+                programmaticValueChange = true;
+                maskitoUpdateElement(input, {
+                    value: nextValue,
+                    selection: [segment.from, segment.to],
+                });
+                programmaticValueChange = false;
+
+                // maskito's pipeline may have moved the caret; re-assert the
+                // segment range and announce the (possibly corrected) value once.
+                input.setSelectionRange(segment.from, segment.to);
+                announce(segment);
+            }
+
+            function caret() {
+                return input.selectionStart ?? 0;
+            }
+
+            input.addEventListener('focus', () => {
+                const first = getSegments(MODE)[0];
+
+                if (first) {
+                    requestAnimationFrame(() => selectSegment(first));
+                }
+            });
+
+            input.addEventListener('keydown', (event) => {
+                const active = getActiveSegment(MODE, caret());
+
+                if (!active) {
+                    return;
+                }
+
+                switch (event.key) {
+                    case 'Tab': {
+                        const next = getAdjacentSegment(
+                            MODE,
+                            caret(),
+                            event.shiftKey ? -1 : 1,
+                        );
+
+                        if (next) {
+                            event.preventDefault();
+                            selectSegment(next);
+                        }
+                        // else: let the browser move focus out of the field.
+                        break;
+                    }
+
+                    case 'ArrowRight':
+                    case 'ArrowLeft': {
+                        const next = getAdjacentSegment(
+                            MODE,
+                            caret(),
+                            event.key === 'ArrowRight' ? 1 : -1,
+                        );
+
+                        event.preventDefault();
+                        selectSegment(next ?? active);
+                        break;
+                    }
+
+                    case 'ArrowUp':
+                        event.preventDefault();
+                        step(active, 1);
+                        break;
+
+                    case 'ArrowDown':
+                        event.preventDefault();
+                        step(active, -1);
+                        break;
+
+                    default:
+                        break;
+                }
+            });
+
+            // After typing into a segment, keep the active segment selected so
+            // the next keystroke/announcement stays scoped to it.
+            input.addEventListener('input', () => {
+                if (programmaticValueChange) {
+                    return;
+                }
+
+                const active = getActiveSegment(MODE, caret());
+
+                if (active) {
+                    announce(active);
+                }
+            });
+        </script>
+    </body>
+</html>
